@@ -1,0 +1,14 @@
+[Unit]
+Description=MQTT hybrid-PQC QUIC tunnel client front end (127.0.0.1:9450 -> remote relay)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/PQC-bench/aioquic-patch/quic-pqc-mqtt-client.env
+ExecStart=/opt/pqc-libs/quic-pqc-venv/bin/python3 /opt/PQC-bench/aioquic-patch/quic_pqc_mqtt_client.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

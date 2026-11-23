@@ -1,0 +1,185 @@
+--- a/aioquic/tls.py
++++ b/aioquic/tls.py
+@@ -30,6 +30,8 @@
+     ec,
+     ed448,
+     ed25519,
++    mldsa,
++    mlkem,
+     padding,
+     rsa,
+     x448,
+@@ -327,6 +329,15 @@
+     X25519 = 0x001D
+     X448 = 0x001E
+     GREASE = 0xAAAA
++    # quic-pqc (2026-09-28): the IANA-assigned TLS codepoint for the X25519+ML-KEM-768 hybrid
++    # group (draft-ietf-tls-ecdhe-mlkem). Handled as a special case throughout this file rather
++    # than through decode_public_key()/encode_public_key() -- those return ONE cryptography key
++    # object typed as EC/X25519/X448, and a hybrid key_share is genuinely two independent keys
++    # concatenated on the wire, not one object those functions could represent.
++    X25519MLKEM768 = 0x11EC
++    # quic-pqc (2026-10-23): the PURE ML-KEM-768 group (codepoint 0x0201) -- key_share is the bare ML-KEM
++    # encapsulation key (client) / ciphertext (server), the shared secret is ML-KEM's alone.
++    MLKEM768 = 0x0201
+ 
+ 
+ class HandshakeType(IntEnum):
+@@ -359,6 +370,8 @@
+     ECDSA_SECP521R1_SHA512 = 0x0603
+     ED25519 = 0x0807
+     ED448 = 0x0808
++    # quic-pqc (2026-09-28): IANA TLS SignatureScheme codepoint for mldsa65.
++    MLDSA65 = 0x0905
+     RSA_PKCS1_SHA256 = 0x0401
+     RSA_PKCS1_SHA384 = 0x0501
+     RSA_PKCS1_SHA512 = 0x0601
+@@ -1180,7 +1193,9 @@
+ 
+ 
+ def signature_algorithm_params(signature_algorithm: int) -> tuple:
+-    if signature_algorithm in (SignatureAlgorithm.ED25519, SignatureAlgorithm.ED448):
++    if signature_algorithm in (
++        SignatureAlgorithm.ED25519, SignatureAlgorithm.ED448, SignatureAlgorithm.MLDSA65
++    ):
+         return tuple()
+ 
+     padding_cls, algorithm_cls = SIGNATURE_ALGORITHMS[signature_algorithm]
+@@ -1336,6 +1351,12 @@
+         self._ec_private_keys: list[ec.EllipticCurvePrivateKey] = []
+         self._x25519_private_key: Optional[x25519.X25519PrivateKey] = None
+         self._x448_private_key: Optional[x448.X448PrivateKey] = None
++        # quic-pqc (2026-09-28): the CLIENT's ephemeral hybrid keypair, held between
++        # _client_send_hello (generated) and _client_handle_hello (consumed against the server's
++        # response) -- same lifetime _x25519_private_key already has for the classical half.
++        self._hybrid_x25519_private_key: Optional[x25519.X25519PrivateKey] = None
++        self._hybrid_mlkem_private_key: Optional[mlkem.MLKEM768PrivateKey] = None
++        self._mlkem_private_key: Optional[mlkem.MLKEM768PrivateKey] = None
+ 
+         if is_client:
+             self.client_random = os.urandom(32)
+@@ -1527,6 +1548,24 @@
+                     encode_public_key(self._x25519_private_key.public_key())
+                 )
+                 supported_groups.append(Group.X25519)
++            elif group == Group.X25519MLKEM768:
++                # quic-pqc (2026-09-28): wire encoding is classical-pub || pq-encap-key,
++                # concatenated -- the standard hybrid key_share shape (client offers BOTH halves).
++                self._hybrid_x25519_private_key = x25519.X25519PrivateKey.generate()
++                self._hybrid_mlkem_private_key = mlkem.MLKEM768PrivateKey.generate()
++                x25519_pub = self._hybrid_x25519_private_key.public_key().public_bytes(
++                    Encoding.Raw, PublicFormat.Raw
++                )
++                mlkem_pub = self._hybrid_mlkem_private_key.public_key().public_bytes(
++                    Encoding.Raw, PublicFormat.Raw
++                )
++                key_share.append((Group.X25519MLKEM768, x25519_pub + mlkem_pub))
++                supported_groups.append(Group.X25519MLKEM768)
++            elif group == Group.MLKEM768:
++                self._mlkem_private_key = mlkem.MLKEM768PrivateKey.generate()
++                key_share.append((Group.MLKEM768, self._mlkem_private_key.public_key().public_bytes(
++                    Encoding.Raw, PublicFormat.Raw)))
++                supported_groups.append(Group.MLKEM768)
+             elif group == Group.X448:
+                 self._x448_private_key = x448.X448PrivateKey.generate()
+                 key_share.append(encode_public_key(self._x448_private_key.public_key()))
+@@ -1651,15 +1690,38 @@
+         self._key_schedule_proxy = None
+ 
+         # perform key exchange
+-        peer_public_key = decode_public_key(peer_hello.key_share)
+         shared_key: Optional[bytes] = None
++        if peer_hello.key_share[0] == Group.MLKEM768:
++            assert self._mlkem_private_key is not None
++            shared_key = self._mlkem_private_key.decapsulate(peer_hello.key_share[1])
++            self._mlkem_private_key = None
++            peer_public_key = None
++        elif peer_hello.key_share[0] == Group.X25519MLKEM768:
++            # quic-pqc (2026-09-28): mirror of the server-side branch in _server_handle_hello --
++            # checked before decode_public_key() for the same reason.
++            assert self._hybrid_x25519_private_key is not None
++            assert self._hybrid_mlkem_private_key is not None
++            peer_x25519_pub = x25519.X25519PublicKey.from_public_bytes(
++                peer_hello.key_share[1][:32]
++            )
++            mlkem_ct = peer_hello.key_share[1][32:]
++            x25519_shared = self._hybrid_x25519_private_key.exchange(peer_x25519_pub)
++            mlkem_shared = self._hybrid_mlkem_private_key.decapsulate(mlkem_ct)
++            shared_key = x25519_shared + mlkem_shared  # same combiner order as the server side
++            self._hybrid_x25519_private_key = None
++            self._hybrid_mlkem_private_key = None
++            peer_public_key = None
++        else:
++            peer_public_key = decode_public_key(peer_hello.key_share)
+         if (
+-            isinstance(peer_public_key, x25519.X25519PublicKey)
++            peer_public_key is not None
++            and isinstance(peer_public_key, x25519.X25519PublicKey)
+             and self._x25519_private_key is not None
+         ):
+             shared_key = self._x25519_private_key.exchange(peer_public_key)
+         elif (
+-            isinstance(peer_public_key, x448.X448PublicKey)
++            peer_public_key is not None
++            and isinstance(peer_public_key, x448.X448PublicKey)
+             and self._x448_private_key is not None
+         ):
+             shared_key = self._x448_private_key.exchange(peer_public_key)
+@@ -1971,11 +2033,37 @@
+             self.key_schedule.update_hash(input_buf.data)
+ 
+         # perform key exchange
+-        public_key: Union[
+-            ec.EllipticCurvePublicKey, x25519.X25519PublicKey, x448.X448PublicKey
+-        ]
++        public_key: Optional[
++            Union[ec.EllipticCurvePublicKey, x25519.X25519PublicKey, x448.X448PublicKey]
++        ] = None
++        hybrid_key_share: Optional[KeyShareEntry] = None
+         shared_key: Optional[bytes] = None
+         for key_share in peer_hello.key_share:
++            # quic-pqc (2026-09-28): checked BEFORE decode_public_key() -- that function returns
++            # ONE cryptography key object typed EC/X25519/X448, which a hybrid key_share (two
++            # independent keys concatenated) cannot be represented as.
++            if key_share[0] == Group.MLKEM768:
++                peer_mlkem_pub = mlkem.MLKEM768PublicKey.from_public_bytes(key_share[1])
++                shared_key, mlkem_ct = peer_mlkem_pub.encapsulate()
++                hybrid_key_share = (Group.MLKEM768, mlkem_ct)
++                break
++            if key_share[0] == Group.X25519MLKEM768:
++                peer_x25519_pub = x25519.X25519PublicKey.from_public_bytes(key_share[1][:32])
++                peer_mlkem_pub = mlkem.MLKEM768PublicKey.from_public_bytes(key_share[1][32:])
++                server_x25519_key = x25519.X25519PrivateKey.generate()
++                x25519_shared = server_x25519_key.exchange(peer_x25519_pub)
++                mlkem_shared, mlkem_ct = peer_mlkem_pub.encapsulate()
++                # Combiner order: classical || post-quantum -- the same order oqs-provider uses
++                # for this project's OTHER "X25519MLKEM768" techs (pqkex/pqc/mqtt-pqc), so this
++                # tech's own crypto convention stays consistent with the rest of the fleet even
++                # though it is a separate, self-contained implementation (not wire-compatible with
++                # those -- this is TLS-inside-QUIC, not a stunnel front door).
++                shared_key = x25519_shared + mlkem_shared
++                server_x25519_pub = server_x25519_key.public_key().public_bytes(
++                    Encoding.Raw, PublicFormat.Raw
++                )
++                hybrid_key_share = (Group.X25519MLKEM768, server_x25519_pub + mlkem_ct)
++                break
+             peer_public_key = decode_public_key(key_share)
+             if isinstance(peer_public_key, x25519.X25519PublicKey):
+                 self._x25519_private_key = x25519.X25519PrivateKey.generate()
+@@ -2001,7 +2089,8 @@
+             legacy_session_id=self.legacy_session_id,
+             cipher_suite=cipher_suite,
+             compression_method=compression_method,
+-            key_share=encode_public_key(public_key),
++            key_share=hybrid_key_share if hybrid_key_share is not None
++            else encode_public_key(public_key),
+             pre_shared_key=pre_shared_key,
+             supported_version=supported_version,
+         )
+@@ -2178,4 +2267,6 @@
+             signature_algorithms = [SignatureAlgorithm.ED25519]
+         elif isinstance(self.certificate_private_key, ed448.Ed448PrivateKey):
+             signature_algorithms = [SignatureAlgorithm.ED448]
++        elif isinstance(self.certificate_private_key, mldsa.MLDSA65PrivateKey):
++            signature_algorithms = [SignatureAlgorithm.MLDSA65]
+         return signature_algorithms

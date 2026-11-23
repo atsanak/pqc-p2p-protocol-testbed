@@ -1,0 +1,125 @@
+diff -ruN '--exclude=*.so' '--exclude=*.egg-info' '--exclude=build' '--exclude=.eggs' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.egg-link' a/wolfssl/_build_ffi.py b/wolfssl/_build_ffi.py
+--- a/wolfssl/_build_ffi.py	2026-09-27 19:15:42.733586465 +0300
++++ b/wolfssl/_build_ffi.py	2026-09-27 19:15:42.736370801 +0300
+@@ -503,6 +503,19 @@
+     int           wolfSSL_dtls_free_peer(void*);
+     int           wolfSSL_dtls_set_peer(WOLFSSL*, void*, unsigned int);
+     const char*   wolfSSL_get_version(const WOLFSSL*);
++    /* PQ-hybrid key-share group selection (2026-09-27, added for the testbed's
++     * pqc-coap-dtls work -- upstream wolfssl-py exposes no group/key-share API at all).
++     * Signatures verified against this exact build's wolfssl/ssl.h before adding these --
++     * `word16` is `unsigned short` in wolfSSL's own typedefs. */
++    int           wolfSSL_UseKeyShare(WOLFSSL*, unsigned short);
++    const char*   wolfSSL_get_curve_name(WOLFSSL*);
++    /* DTLS MTU (2026-09-27, added the same day as the two above, for the identical reason: no
++     * API for it upstream either. Needed once this transport left loopback for a real WireGuard
++     * link (1420-byte tunnel MTU) -- wolfSSL's own default DTLS fragmentation threshold
++     * (WOLFSSL_MAX_MTU, 1400) plus its own record/UDP/IP header overhead exceeds that, and the
++     * resulting oversized datagram is silently dropped by the tunnel (DF set, no PMTU signal
++     * back), manifesting as a client-side SOCKET_ERROR_E with nothing ever reaching the peer. */
++    int           wolfSSL_dtls_set_mtu(WOLFSSL*, unsigned short);
+ 
+     /*
+      * WOLFSSL_X509 functions
+diff -ruN '--exclude=*.so' '--exclude=*.egg-info' '--exclude=build' '--exclude=.eggs' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.egg-link' a/wolfssl/__init__.py b/wolfssl/__init__.py
+--- a/wolfssl/__init__.py	2026-09-27 19:15:42.733557448 +0300
++++ b/wolfssl/__init__.py	2026-09-27 19:15:42.735951692 +0300
+@@ -65,6 +65,15 @@
+ CERT_OPTIONAL = _SSL_VERIFY_PEER
+ CERT_REQUIRED = (_SSL_VERIFY_PEER | _SSL_VERIFY_FAIL_IF_NO_PEER_CERT)
+ 
++# PQ-hybrid key-share group IDs for `key_share_group=` (2026-09-27, testbed addition, not
++# upstream). Values from wolfssl/ssl.h's WOLFSSL_TLS_GROUP_ID enum
++# (draft-ietf-tls-ecdhe-mlkem); this build must be configured with --enable-curve25519 for
++# X25519MLKEM768 specifically (the plain X25519 curve implementation, not just the ML-KEM side).
++WOLFSSL_X25519MLKEM768 = 4588
++WOLFSSL_SECP256R1MLKEM768 = 4587
++WOLFSSL_SECP384R1MLKEM1024 = 4589
++WOLFSSL_ML_KEM_768 = 513   # standalone, non-hybrid -- needs --enable-tls-mlkem-standalone too
++
+ _VERIFY_MODE_LIST = [CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED]
+ 
+ _SSL_SUCCESS = 1
+@@ -254,7 +263,7 @@
+     def wrap_socket(self, sock, server_side=None,
+                     do_handshake_on_connect=True,
+                     suppress_ragged_eofs=True,
+-                    server_hostname=None):
++                    server_hostname=None, key_share_group=None, dtls_mtu=None):
+         """
+         Wrap an existing Python socket sock and return an SSLSocket object.
+         sock must be a SOCK_STREAM socket; other socket types are unsupported.
+@@ -283,7 +292,8 @@
+         return SSLSocket(sock=sock, server_side=server_side,
+                          do_handshake_on_connect=do_handshake_on_connect,
+                          suppress_ragged_eofs=suppress_ragged_eofs,
+-                         _context=self, server_hostname=server_hostname)
++                         _context=self, server_hostname=server_hostname,
++                         key_share_group=key_share_group, dtls_mtu=dtls_mtu)
+ 
+     def set_ciphers(self, ciphers):
+         """
+@@ -418,7 +428,20 @@
+                  do_handshake_on_connect=True, family=AF_INET,
+                  sock_type=SOCK_STREAM, proto=0, fileno=None,
+                  suppress_ragged_eofs=True, ciphers=None,
+-                 _context=None, server_hostname=None):
++                 _context=None, server_hostname=None, key_share_group=None, dtls_mtu=None):
++        # `key_share_group` (2026-09-27, testbed addition, not upstream): a wolfSSL group ID
++        # (e.g. WOLFSSL_X25519MLKEM768) to force via wolfSSL_UseKeyShare() -- without this,
++        # nothing in this package can ever negotiate a PQ-hybrid group, the same gap the C
++        # example client's own --pqc flag exists to close. None = wolfSSL's own default
++        # group list, unchanged behavior for every existing caller of this class.
++        self._key_share_group = key_share_group
++        # `dtls_mtu` (2026-09-27, testbed addition, not upstream): forces wolfSSL_dtls_set_mtu()
++        # below wolfSSL's own default DTLS fragmentation threshold (WOLFSSL_MAX_MTU, 1400) --
++        # needed the day this left loopback for a real tunnel with a SMALLER MTU (a 1420-byte
++        # WireGuard link, in this case): 1400 plus wolfSSL's own DTLS record/UDP/IP header
++        # overhead already exceeds 1420, so the resulting oversized datagram is silently dropped
++        # by the tunnel. None = wolfSSL's own default, unchanged for every existing caller.
++        self._dtls_mtu = dtls_mtu
+ 
+         # set options
+         self.do_handshake_on_connect = do_handshake_on_connect
+@@ -489,6 +512,23 @@
+             self._release_native_object()
+             raise ValueError("Unable to set fd to ssl object")
+ 
++        if self._key_share_group is not None:
++            ret = _lib.wolfSSL_UseKeyShare(self.native_object, self._key_share_group)
++            if ret != _SSL_SUCCESS:
++                self._release_native_object()
++                raise ValueError(
++                    f"wolfSSL_UseKeyShare({self._key_share_group}) failed (rc={ret}) -- "
++                    f"was this build configured with --enable-curve25519 "
++                    f"--enable-tls-mlkem-standalone (or the hybrid equivalent)?")
++
++        if self._dtls_mtu is not None:
++            ret = _lib.wolfSSL_dtls_set_mtu(self.native_object, self._dtls_mtu)
++            if ret != _SSL_SUCCESS:
++                self._release_native_object()
++                raise ValueError(
++                    f"wolfSSL_dtls_set_mtu({self._dtls_mtu}) failed (rc={ret}) -- "
++                    f"was this build configured with --enable-dtls-mtu?")
++
+         # match domain name / host name if set in context
+         if server_hostname is not None:
+             if self._context.check_hostname:
+@@ -951,6 +991,17 @@
+             _lib.wolfSSL_get_version(
+                 self.native_object)).decode("ascii")
+ 
++    def negotiated_group(self):
++        """
++        (2026-09-27, testbed addition, not upstream) The NEGOTIATED key-exchange group's name,
++        e.g. "X25519MLKEM768" -- the thing that actually proves a hybrid PQ handshake happened,
++        not just that one was requested. Mirrors the C example client's own "SSL curve name is
++        ..." line. None if wolfSSL doesn't report one for this connection.
++        """
++        self._check_closed("negotiated_group")
++        ptr = _lib.wolfSSL_get_curve_name(self.native_object)
++        return _ffi.string(ptr).decode("ascii") if ptr != _ffi.NULL else None
++
+     # The following functions expose functionality of the underlying
+     # Socket object. These are also exposed through Python's ssl module
+     # API and are provided here for compatibility.

@@ -1,0 +1,17 @@
+[Unit]
+Description=MQTT-side hybrid-PQC QUIC relay, MUTUAL (client cert REQUIRED) -> plain broker :1883
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=QUIC_PQC_MQTT_MUTUAL=1
+Environment=QUIC_PQC_MQTT_NODE_NAME=T1-Protectli2-gw-T1
+Environment=QUIC_PQC_MQTT_NODE_IP=10.2.1.1
+Environment=QUIC_PQC_MQTT_TENANT=T1
+ExecStart=/opt/pqc-libs/quic-pqc-venv/bin/python3 /opt/PQC-bench/aioquic-patch/quic_pqc_mqtt_relay.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

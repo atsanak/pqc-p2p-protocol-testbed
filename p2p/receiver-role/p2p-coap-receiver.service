@@ -1,0 +1,15 @@
+[Unit]
+Description=P2P peer receiver-role CoAP server (Stage D transport)
+After=network-online.target p2p-receiver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/p2p
+EnvironmentFile=/opt/p2p/.env
+ExecStart=/usr/bin/python3 /opt/p2p/receiver-role/coap_server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

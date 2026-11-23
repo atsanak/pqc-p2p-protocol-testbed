@@ -1,0 +1,157 @@
+--- a/wolfssl/_build_ffi.py
++++ b/wolfssl/_build_ffi.py
+@@ -176,6 +176,41 @@
+     if not disable_scr:
+         flags.append("--enable-secure-renegotiation")
+     flags.append("--enable-opensslall")
++
++    # DTLS-SRTP (2026-09-28, testbed addition, not upstream): this internal wolfSSL rebuild had
++    # no --enable-srtp, so WOLFSSL_SRTP was never defined and wolfSSL_set_tlsext_use_srtp /
++    # wolfSSL_export_dtls_srtp_keying_material didn't exist in the resulting static lib at all --
++    # confirmed live via `nm` on libwolfssl.a (only IsDtlsNotSrtpMode present, no real SRTP
++    # symbol) after a first build attempt without this flag linked "successfully" anyway (a
++    # shared object linker allows undefined symbols by default; the crash would only have shown
++    # up the first time Python actually CALLED one of them).
++    flags.append("--enable-srtp")
++    # Hybrid PQ-KEX (2026-09-28, matching PQC-bench/install-wolfssl-dtls.sh's OWN proven configure
++    # line exactly): this internal rebuild step (triggered by re-running _build_ffi.py, which
++    # auto-clones+configures its own wolfssl/ under lib/wolfssl/ independent of whatever
++    # /opt/pqc-libs/wolfssl-dtls already had built) did NOT carry these over on its own --
++    # wolfSSL_UseKeyShare(WOLFSSL_X25519MLKEM768) failed live with rc=-173
++    # (NOT_COMPILED_IN) the first time this was missed, breaking the key-share-group.patch
++    # feature that already worked before this file started managing its own SRTP addition.
++    flags.append("--enable-curve25519")
++    flags.append("--enable-tls-mlkem-standalone")
++    flags.append("--enable-dtls-mtu")
++    # ML-DSA-65 cert loading (2026-09-28): the individual flags above still couldn't
++    # load_cert_chain() this tenant's real /var/lib/p2p/certs-pqc/peer.crt (ML-DSA-65) --
++    # "Unable to load certificate chain. E(0)" -- confirmed live, even though the SAME cert loads
++    # fine against the PROVEN production build at /opt/pqc-libs/wolfssl-dtls (built by
++    # PQC-bench/install-wolfssl-dtls.sh's own `--enable-all --enable-secure-renegotiation
++    # --enable-dtls13 --enable-dtls-mtu --enable-curve25519 --enable-tls-mlkem-standalone` line).
++    # Rather than hand-pick which of --enable-all's many sub-features ML-DSA parsing actually
++    # needs, just match that proven line exactly.
++    flags.append("--enable-all")
++    # ML-DSA/Dilithium (2026-09-28): --enable-all does NOT imply this -- confirmed live via
++    # `./configure --help`: "--enable-mldsa  Enable ML-DSA/Dilithium (default: disabled)" is its
++    # own separate flag. Without it, load_cert_chain() on this tenant's real ML-DSA-65 leaf
++    # (OID 2.16.840.1.101.3.4.3.18, confirmed via `openssl x509 -text`) fails with "Unable to
++    # load certificate chain. E(0)" -- wolfSSL's parser doesn't recognize the algorithm OID at
++    # all when this isn't compiled in, not a cert-format problem.
++    flags.append("--enable-mldsa")
+     cflags.append("-DFP_MAX_BITS=8192")
+     cflags.append("-DHAVE_EX_DATA")
+     cflags.append("-DOPENSSL_COMPATIBLE_DEFAULTS")
+@@ -516,6 +551,14 @@
+      * resulting oversized datagram is silently dropped by the tunnel (DF set, no PMTU signal
+      * back), manifesting as a client-side SOCKET_ERROR_E with nothing ever reaching the peer. */
+     int           wolfSSL_dtls_set_mtu(WOLFSSL*, unsigned short);
++    /* DTLS-SRTP keying material export (2026-09-28, added for the video-streaming RTP+DTLS-SRTP
++     * leg -- upstream wolfssl-py exposes no SRTP API at all, same gap key-share-group/dtls_mtu
++     * above closed for their own features. Signatures verified against this exact build's
++     * wolfssl/ssl.h (guarded by #ifdef WOLFSSL_SRTP there, and this build IS configured with it
++     * via --enable-all). `wolfSSL_export_dtls_srtp_keying_material`'s `olen` is `size_t*` --
++     * cffi's `size_t` maps to the platform's real size_t, matching the C prototype exactly. */
++    int           wolfSSL_set_tlsext_use_srtp(WOLFSSL*, const char*);
++    int           wolfSSL_export_dtls_srtp_keying_material(WOLFSSL*, unsigned char*, size_t*);
+ 
+     /*
+      * WOLFSSL_X509 functions
+--- a/wolfssl/__init__.py
++++ b/wolfssl/__init__.py
+@@ -263,7 +263,8 @@
+     def wrap_socket(self, sock, server_side=None,
+                     do_handshake_on_connect=True,
+                     suppress_ragged_eofs=True,
+-                    server_hostname=None, key_share_group=None, dtls_mtu=None):
++                    server_hostname=None, key_share_group=None, dtls_mtu=None,
++                    use_srtp=None):
+         """
+         Wrap an existing Python socket sock and return an SSLSocket object.
+         sock must be a SOCK_STREAM socket; other socket types are unsupported.
+@@ -293,7 +294,8 @@
+                          do_handshake_on_connect=do_handshake_on_connect,
+                          suppress_ragged_eofs=suppress_ragged_eofs,
+                          _context=self, server_hostname=server_hostname,
+-                         key_share_group=key_share_group, dtls_mtu=dtls_mtu)
++                         key_share_group=key_share_group, dtls_mtu=dtls_mtu,
++                         use_srtp=use_srtp)
+ 
+     def set_ciphers(self, ciphers):
+         """
+@@ -428,7 +430,8 @@
+                  do_handshake_on_connect=True, family=AF_INET,
+                  sock_type=SOCK_STREAM, proto=0, fileno=None,
+                  suppress_ragged_eofs=True, ciphers=None,
+-                 _context=None, server_hostname=None, key_share_group=None, dtls_mtu=None):
++                 _context=None, server_hostname=None, key_share_group=None, dtls_mtu=None,
++                 use_srtp=None):
+         # `key_share_group` (2026-09-27, testbed addition, not upstream): a wolfSSL group ID
+         # (e.g. WOLFSSL_X25519MLKEM768) to force via wolfSSL_UseKeyShare() -- without this,
+         # nothing in this package can ever negotiate a PQ-hybrid group, the same gap the C
+@@ -442,6 +445,14 @@
+         # overhead already exceeds 1420, so the resulting oversized datagram is silently dropped
+         # by the tunnel. None = wolfSSL's own default, unchanged for every existing caller.
+         self._dtls_mtu = dtls_mtu
++        # `use_srtp` (2026-09-28, testbed addition, not upstream): a wolfSSL SRTP protection
++        # profile string (e.g. "SRTP_AES128_CM_SHA1_80") to negotiate via
++        # wolfSSL_set_tlsext_use_srtp() BEFORE the handshake -- RFC 5764's `use_srtp` extension.
++        # Both ends must pass the SAME profile string (this binding does no negotiation of its
++        # own beyond wolfSSL's own extension handling); None = SRTP keying disabled, unchanged
++        # behavior for every existing caller. See export_srtp_keying_material() for the other
++        # half (post-handshake key export).
++        self._use_srtp = use_srtp
+ 
+         # set options
+         self.do_handshake_on_connect = do_handshake_on_connect
+@@ -529,6 +540,19 @@
+                     f"wolfSSL_dtls_set_mtu({self._dtls_mtu}) failed (rc={ret}) -- "
+                     f"was this build configured with --enable-dtls-mtu?")
+ 
++        if self._use_srtp is not None:
++            profile = _ffi.new("char[]", self._use_srtp.encode("ascii"))
++            # OpenSSL-compat return convention here, NOT wolfSSL's own SSL_SUCCESS=1 (confirmed
++            # live against this build's ssl_api_dtls.c: "@return 0 on success ... 1 on error, to
++            # match OpenSSL" -- every other wolfSSL-native call in this file uses the opposite
++            # convention, which is what made this look like a failure at rc=0 the first time).
++            ret = _lib.wolfSSL_set_tlsext_use_srtp(self.native_object, profile)
++            if ret != 0:
++                self._release_native_object()
++                raise ValueError(
++                    f"wolfSSL_set_tlsext_use_srtp({self._use_srtp!r}) failed (rc={ret}) -- "
++                    f"was this build configured with --enable-srtp (or --enable-all)?")
++
+         # match domain name / host name if set in context
+         if server_hostname is not None:
+             if self._context.check_hostname:
+@@ -1002,6 +1026,30 @@
+         ptr = _lib.wolfSSL_get_curve_name(self.native_object)
+         return _ffi.string(ptr).decode("ascii") if ptr != _ffi.NULL else None
+ 
++    def export_srtp_keying_material(self, length=60):
++        """
++        (2026-09-28, testbed addition, not upstream) The RFC 5764 DTLS-SRTP keying material this
++        handshake derived -- call AFTER do_handshake(), on BOTH ends: they must come back
++        byte-identical, which is the actual cryptographic proof this leg's SRTP session keys are
++        real (derived from the DTLS 1.3 master secret via wolfSSL's own SRTP KDF), not locally
++        invented. `length` defaults to 60 (RFC 5764's SRTP_AES128_CM_SHA1_80 layout: 16+16 client/
++        server write keys + 14+14 client/server write salts); a caller using a different profile
++        with a different key/salt size passes the matching total.
++
++        Requires `use_srtp=` to have been set on wrap_socket() -- raises ValueError otherwise
++        (wolfSSL itself returns an error rc, surfaced here with the same message shape every
++        other testbed addition in this file uses).
++        """
++        self._check_closed("export_srtp_keying_material")
++        buf = _ffi.new(f"unsigned char[{length}]")
++        olen = _ffi.new("size_t*", length)
++        ret = _lib.wolfSSL_export_dtls_srtp_keying_material(self.native_object, buf, olen)
++        if ret != _SSL_SUCCESS:
++            raise ValueError(
++                f"wolfSSL_export_dtls_srtp_keying_material failed (rc={ret}) -- was "
++                f"use_srtp= set on wrap_socket() for BOTH ends of this connection?")
++        return bytes(_ffi.buffer(buf, olen[0]))
++
+     # The following functions expose functionality of the underlying
+     # Socket object. These are also exposed through Python's ssl module
+     # API and are provided here for compatibility.

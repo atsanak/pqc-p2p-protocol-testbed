@@ -1,0 +1,18 @@
+# p2p-pqc-proxy.service -- the P2P peer's hybrid-TLS front door (:9444 -> its plain :8442),
+# stunnel with the private OpenSSL 3.4 build, set up by run-p2p-proxy.sh. A unit so it comes back
+# after a reboot and after a crash, same reasoning as ../gateway/pqc-tls-proxy.service.
+# Its own unit, never a distro stunnel service.
+[Unit]
+Description=P2P hybrid-TLS front door (stunnel :9444 -> P2P plain :8442)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/opt/PQC-bench/p2p-proxy/run/stunnel-p2p-pqc.pid
+ExecStart=/bin/bash /opt/PQC-bench/p2p-proxy/run-p2p-proxy.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

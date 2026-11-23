@@ -1,0 +1,23 @@
+[Unit]
+Description=P2P peer receiver-role quic-hybrid relay (hybrid X25519MLKEM768 + classical RSA certs, HTTP/3)
+After=network-online.target p2p-receiver.service
+Wants=network-online.target
+Requires=p2p-receiver.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/p2p
+EnvironmentFile=/opt/p2p/.env
+# 2026-10-02: quic_pqc_relay.py in CLASSICAL-CERT mode -- the fleet's RSA leaf from
+# /var/lib/p2p/certs, read-only. QUIC_GROUPS pins the key exchange this port accepts.
+Environment=P2P_QUIC_PQC_PORT=4441 QUIC_CERT_MODE=classical QUIC_GROUPS=X25519MLKEM768 P2P_QUIC_PQC_MUTUAL=0
+ExecStart=/opt/pqc-libs/quic-pqc-venv/bin/python3 /opt/p2p/receiver-role/quic_pqc_relay.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+# Wanted by the receiver it Requires=, not by multi-user.target: the relay then runs exactly when
+# p2p-receiver.service runs. Requires= alone carries a STOP down (a lifecycle stop/pause disables the
+# receiver) but never a START back up, so with WantedBy=multi-user.target a stop + restart left
+# the relay dead until the next boot (T1-Rpi51 2026-10-03). Change [Install] => `systemctl reenable`.
+WantedBy=p2p-receiver.service
